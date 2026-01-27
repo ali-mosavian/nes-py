@@ -87,14 +87,26 @@ inline void pin_thread_to_core(int core_id) {
 
 class VectorEmulator {
 private:
+    // Worker states - each worker only touches its own state (cache-line isolated)
     static constexpr int STATE_IDLE = 0;
     static constexpr int STATE_PENDING = 1;
     static constexpr int STATE_DONE = 2;
     static constexpr int STATE_EXIT = 3;
+    
+    // Cache line size for padding (typically 64 bytes on x86/ARM)
+    static constexpr size_t CACHE_LINE_SIZE = 64;
+    
+    // Cache-line aligned atomic to prevent false sharing
+    struct alignas(CACHE_LINE_SIZE) AlignedAtomic {
+        std::atomic<int> state{STATE_IDLE};
+        char padding[CACHE_LINE_SIZE - sizeof(std::atomic<int>)];
+        
+        AlignedAtomic() : state(STATE_IDLE) {}
+    };
 
 public:
     VectorEmulator(const std::string& rom_path, int num_envs) 
-        : num_envs_(num_envs), rom_path_(rom_path), done_count_(0), ready_count_(0) {
+        : num_envs_(num_envs), rom_path_(rom_path), ready_count_(0) {
         
         emulators_.reserve(num_envs);
         worker_states_.reserve(num_envs);
@@ -102,7 +114,7 @@ public:
         
         for (int i = 0; i < num_envs; i++) {
             emulators_.push_back(std::make_unique<NES::Emulator>(rom_path));
-            worker_states_.push_back(std::make_unique<std::atomic<int>>(STATE_IDLE));
+            worker_states_.push_back(std::make_unique<AlignedAtomic>());
         }
         
         workers_.reserve(num_envs);
@@ -110,20 +122,17 @@ public:
             workers_.emplace_back(&VectorEmulator::worker_loop, this, i);
         }
         
-        // Wait for all workers to be ready (have entered their wait loop)
-        {
-            std::unique_lock<std::mutex> lock(ready_mutex_);
-            ready_cv_.wait(lock, [this]() {
-                return ready_count_.load(std::memory_order_acquire) == num_envs_;
-            });
+        // Wait for all workers to be ready (busy-wait on atomic counter)
+        while (ready_count_.load(std::memory_order_acquire) < num_envs) {
+            std::this_thread::yield();
         }
     }
     
     ~VectorEmulator() {
+        // Signal all workers to exit
         for (int i = 0; i < num_envs_; i++) {
-            worker_states_[i]->store(STATE_EXIT, std::memory_order_release);
+            worker_states_[i]->state.store(STATE_EXIT, std::memory_order_release);
         }
-        start_cv_.notify_all();
         
         for (auto& w : workers_) {
             if (w.joinable()) {
@@ -144,7 +153,7 @@ public:
     // Reset single emulator
     void reset_env(int idx) {
         check_idx(idx);
-        while (worker_states_[idx]->load(std::memory_order_acquire) != STATE_IDLE) {
+        while (worker_states_[idx]->state.load(std::memory_order_acquire) != STATE_IDLE) {
             std::this_thread::yield();
         }
         emulators_[idx]->reset();
@@ -159,7 +168,7 @@ public:
     void step_single(int idx, uint8_t action) {
         check_idx(idx);
         // Wait for any pending work on this emulator
-        while (worker_states_[idx]->load(std::memory_order_acquire) != STATE_IDLE) {
+        while (worker_states_[idx]->state.load(std::memory_order_acquire) != STATE_IDLE) {
             std::this_thread::yield();
         }
         // Set action and step directly (no threading)
@@ -256,7 +265,7 @@ public:
     void load_state(int idx, const py::array_t<uint8_t>& state) {
         check_idx(idx);
         // Wait for worker to be idle before modifying emulator state
-        while (worker_states_[idx]->load(std::memory_order_acquire) != STATE_IDLE) {
+        while (worker_states_[idx]->state.load(std::memory_order_acquire) != STATE_IDLE) {
             std::this_thread::yield();
         }
         emulators_[idx]->restore(reinterpret_cast<const NES::Core*>(state.request().ptr));
@@ -277,27 +286,36 @@ private:
         auto actions_buf = actions.request();
         uint8_t* actions_ptr = static_cast<uint8_t*>(actions_buf.ptr);
         
-        // Set actions and signal workers
-        done_count_.store(0, std::memory_order_release);
+        // Set actions and mark workers as pending (lock-free)
         for (int i = 0; i < num_envs_; i++) {
             *emulators_[i]->get_controller(0) = actions_ptr[i];
             worker_frames_[i] = num_frames;
-            worker_states_[i]->store(STATE_PENDING, std::memory_order_release);
+            worker_states_[i]->state.store(STATE_PENDING, std::memory_order_release);
         }
-        start_cv_.notify_all();
         
-        // Wait for completion (GIL released)
+        // Busy-wait for all workers to complete (GIL released, lock-free)
         {
             py::gil_scoped_release release;
-            std::unique_lock<std::mutex> lock(done_mutex_);
-            done_cv_.wait(lock, [this]() {
-                return done_count_.load(std::memory_order_acquire) == num_envs_;
-            });
+            
+            // Spin until all workers are done
+            while (true) {
+                bool all_done = true;
+                for (int i = 0; i < num_envs_; i++) {
+                    if (worker_states_[i]->state.load(std::memory_order_acquire) != STATE_DONE) {
+                        all_done = false;
+                        break;
+                    }
+                }
+                if (all_done) break;
+                
+                // Brief pause to reduce CPU spinning overhead
+                std::this_thread::yield();
+            }
         }
         
-        // Mark workers idle
+        // Mark workers idle (ready for next step)
         for (int i = 0; i < num_envs_; i++) {
-            worker_states_[i]->store(STATE_IDLE, std::memory_order_release);
+            worker_states_[i]->state.store(STATE_IDLE, std::memory_order_release);
         }
     }
     
@@ -306,37 +324,29 @@ private:
         // This is especially important on NUMA systems (e.g., AMD EPYC)
         pin_thread_to_core(idx);
         
-        // Signal that this worker is ready (has reached its wait loop)
-        {
-            std::lock_guard<std::mutex> lock(ready_mutex_);
-            if (ready_count_.fetch_add(1, std::memory_order_release) + 1 == num_envs_) {
-                ready_cv_.notify_one();
-            }
-        }
+        // Signal that this worker is ready
+        ready_count_.fetch_add(1, std::memory_order_release);
         
         while (true) {
-            {
-                std::unique_lock<std::mutex> lock(start_mutex_);
-                start_cv_.wait(lock, [this, idx]() {
-                    int state = worker_states_[idx]->load(std::memory_order_acquire);
-                    return state == STATE_PENDING || state == STATE_EXIT;
-                });
+            // Busy-wait for work (lock-free - each worker only checks its own state)
+            int state;
+            while (true) {
+                state = worker_states_[idx]->state.load(std::memory_order_acquire);
+                if (state == STATE_PENDING || state == STATE_EXIT) break;
+                std::this_thread::yield();
             }
             
-            if (worker_states_[idx]->load(std::memory_order_acquire) == STATE_EXIT) {
+            if (state == STATE_EXIT) {
                 return;
             }
             
-            // Step emulator
+            // Step emulator (the actual work)
             for (int f = 0; f < worker_frames_[idx]; f++) {
                 emulators_[idx]->step();
             }
             
-            // Signal completion
-            worker_states_[idx]->store(STATE_DONE, std::memory_order_release);
-            if (done_count_.fetch_add(1, std::memory_order_release) + 1 == num_envs_) {
-                done_cv_.notify_one();
-            }
+            // Signal completion (lock-free - just update our own state)
+            worker_states_[idx]->state.store(STATE_DONE, std::memory_order_release);
         }
     }
     
@@ -344,18 +354,10 @@ private:
     std::string rom_path_;
     std::vector<std::unique_ptr<NES::Emulator>> emulators_;
     std::vector<std::thread> workers_;
-    std::vector<std::unique_ptr<std::atomic<int>>> worker_states_;
+    std::vector<std::unique_ptr<AlignedAtomic>> worker_states_;  // Cache-line aligned to prevent false sharing
     std::vector<int> worker_frames_;
     
-    std::mutex start_mutex_;
-    std::condition_variable start_cv_;
-    std::mutex done_mutex_;
-    std::condition_variable done_cv_;
-    std::atomic<int> done_count_;
-    
-    // Worker ready synchronization
-    std::mutex ready_mutex_;
-    std::condition_variable ready_cv_;
+    // Worker ready synchronization (only used during startup)
     std::atomic<int> ready_count_;
 };
 
