@@ -18,11 +18,55 @@
 #include <condition_variable>
 #include <atomic>
 
+// Platform-specific headers for CPU affinity
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#include <mach/thread_policy.h>
+#include <mach/thread_act.h>
+#elif defined(_WIN32)
+#include <windows.h>
+#endif
+
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
 namespace py = pybind11;
+
+// =============================================================================
+// CPU Affinity - Pin threads to specific cores for better cache locality
+// =============================================================================
+
+/// Pin the current thread to a specific CPU core.
+/// On Linux: Uses pthread_setaffinity_np for hard affinity.
+/// On macOS: Uses thread_policy_set (hint only, not guaranteed).
+/// On Windows: Uses SetThreadAffinityMask.
+inline void pin_thread_to_core(int core_id) {
+    int num_cores = std::thread::hardware_concurrency();
+    if (num_cores == 0 || core_id < 0) return;
+    
+    // Wrap around if core_id exceeds available cores
+    core_id = core_id % num_cores;
+    
+#ifdef __linux__
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+#elif defined(__APPLE__)
+    // macOS: thread affinity is only a hint, not enforced
+    thread_affinity_policy_data_t policy = { core_id };
+    thread_policy_set(pthread_mach_thread_np(pthread_self()),
+                      THREAD_AFFINITY_POLICY,
+                      (thread_policy_t)&policy,
+                      THREAD_AFFINITY_POLICY_COUNT);
+#elif defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), 1ULL << core_id);
+#endif
+}
 
 // =============================================================================
 // VectorEmulator - Parallel NES emulation with zero-copy observations
@@ -258,6 +302,10 @@ private:
     }
     
     void worker_loop(int idx) {
+        // Pin this worker thread to a specific CPU core for better cache locality
+        // This is especially important on NUMA systems (e.g., AMD EPYC)
+        pin_thread_to_core(idx);
+        
         // Signal that this worker is ready (has reached its wait loop)
         {
             std::lock_guard<std::mutex> lock(ready_mutex_);
