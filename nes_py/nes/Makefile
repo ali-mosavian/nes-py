@@ -11,7 +11,8 @@ CXXFLAGS := -std=c++14 -O3 -pipe -fPIC -Wno-unused-value
 INCLUDES := -I$(dir $(lastword $(MAKEFILE_LIST)))include -I$(PYBIND11_PATH) -I$(PYTHON_INCLUDE)
 
 # Platform-specific settings and common LDFLAGS
-LDFLAGS := -L$(PYTHON_LIBDIR) -lpython$(PYTHON_VERSION)
+# Don't link python library directly - use undefined dynamic_lookup
+LDFLAGS :=
 
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)

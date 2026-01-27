@@ -87,7 +87,7 @@ def main() -> None:
     
     setup(
         name='nes_py',
-        version='9.1.4',
+        version='9.2.0',
         description='An NES Emulator with Gymnasium interface',
         long_description=read_readme(),
         long_description_content_type='text/markdown',
