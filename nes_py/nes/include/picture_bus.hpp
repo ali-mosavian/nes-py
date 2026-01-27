@@ -54,6 +54,14 @@ class PictureBus {
         this->mapper = mapper; update_mirroring();
     }
 
+    /// Copy RAM/palette state from another PictureBus (preserves mapper)
+    inline void copy_ram_from(const PictureBus& other) {
+        ram = other.ram;
+        for (int i = 0; i < 4; i++) name_tables[i] = other.name_tables[i];
+        palette = other.palette;
+        // Note: mapper is NOT copied
+    }
+
     /// Read a color index from the palette.
     ///
     /// @param address the address of the palette color

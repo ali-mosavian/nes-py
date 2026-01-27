@@ -34,8 +34,23 @@ struct Core {
     void initialize(Controller* const controllers);    
     void reset();
     void set_mapper(Mapper *mapper);
+    Mapper* get_mapper() const { return bus.get_mapper(); }
     void ppu_step(NESFrameBufferT* const framebuffer);
     void step(NESFrameBufferT* const framebuffer);
+
+    /// Copy state from another Core, preserving local mapper and callbacks.
+    /// This is safe to use with snapshots from destroyed emulators because
+    /// we only copy raw data, not pointers or function objects.
+    inline void copy_state_from(const Core& other) {
+        // Copy RAM state (preserves mapper and callbacks)
+        bus.copy_ram_from(other.bus);
+        // Copy CPU state (all plain data)
+        cpu = other.cpu;
+        // Copy PPU state (preserves vblank_callback)
+        ppu.copy_state_from(other.ppu);
+        // Copy picture bus RAM (preserves mapper)
+        picture_bus.copy_ram_from(other.picture_bus);
+    }
 };
 
 /// An NES Emulator and OpenAI Gym interface
@@ -88,8 +103,11 @@ class Emulator {
     }
 
     /// Restore the snapshot state on the emulator.
+    /// Uses copy_state_from to safely copy only data, preserving local
+    /// mapper pointer and callbacks which may contain dangling references
+    /// in snapshots from destroyed emulators.
     inline void restore(const Core* const core) {
-        this->core = *core;
+        this->core.copy_state_from(*core);
     }
 
  private:

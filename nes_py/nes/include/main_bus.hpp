@@ -91,6 +91,12 @@ class MainBus {
     ///
     void set_mapper(Mapper* mapper);
 
+    /// Get the mapper pointer.
+    ///
+    /// @return the current mapper pointer
+    ///
+    inline Mapper* get_mapper() const { return mapper; }
+
     /// Set a callback for when writes occur.
     inline void set_write_callback(IORegisters reg, WriteCallback callback) {
         write_callbacks.insert({reg, callback});
@@ -103,6 +109,13 @@ class MainBus {
 
     /// Return a pointer to the page in memory.
     const NES_Byte* get_page_pointer(NES_Byte page);
+
+    /// Copy RAM state from another MainBus (preserves mapper and callbacks)
+    inline void copy_ram_from(const MainBus& other) {
+        ram = other.ram;
+        extended_ram = other.extended_ram;
+        // Note: mapper and callbacks are NOT copied
+    }
 };
 
 }  // namespace NES

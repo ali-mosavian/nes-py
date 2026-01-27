@@ -50,7 +50,7 @@ private:
 
 public:
     VectorEmulator(const std::string& rom_path, int num_envs) 
-        : num_envs_(num_envs), rom_path_(rom_path), done_count_(0) {
+        : num_envs_(num_envs), rom_path_(rom_path), done_count_(0), ready_count_(0) {
         
         emulators_.reserve(num_envs);
         worker_states_.reserve(num_envs);
@@ -64,6 +64,14 @@ public:
         workers_.reserve(num_envs);
         for (int i = 0; i < num_envs; i++) {
             workers_.emplace_back(&VectorEmulator::worker_loop, this, i);
+        }
+        
+        // Wait for all workers to be ready (have entered their wait loop)
+        {
+            std::unique_lock<std::mutex> lock(ready_mutex_);
+            ready_cv_.wait(lock, [this]() {
+                return ready_count_.load(std::memory_order_acquire) == num_envs_;
+            });
         }
     }
     
@@ -101,6 +109,18 @@ public:
     // Step all emulators 1 frame in parallel (like NESEmulator.step())
     void step(py::array_t<uint8_t> actions) {
         step_impl(actions, 1);
+    }
+    
+    // Step a single emulator (synchronous, no threading)
+    void step_single(int idx, uint8_t action) {
+        check_idx(idx);
+        // Wait for any pending work on this emulator
+        while (worker_states_[idx]->load(std::memory_order_acquire) != STATE_IDLE) {
+            std::this_thread::yield();
+        }
+        // Set action and step directly (no threading)
+        *emulators_[idx]->get_controller(0) = action;
+        emulators_[idx]->step();
     }
     
     // Get screen buffer for all emulators as list of zero-copy views
@@ -166,6 +186,39 @@ public:
         );
     }
     
+    // Dump state for single emulator
+    py::array_t<uint8_t> dump_state(int idx) {
+        check_idx(idx);
+        
+        // Create a copy of the state data
+        auto* core = new NES::Core;
+        memset(core, 0, sizeof(NES::Core));
+        emulators_[idx]->snapshot(core);
+        
+        // Create capsule to own the memory
+        py::capsule capsule(core, [](void* p) {
+            delete static_cast<NES::Core*>(p);
+        });
+        
+        return py::array_t<uint8_t>(
+            {sizeof(NES::Core)},
+            {1},
+            reinterpret_cast<uint8_t*>(core),
+            capsule
+        );
+    }
+    
+    // Load state for single emulator
+    void load_state(int idx, const py::array_t<uint8_t>& state) {
+        check_idx(idx);
+        // Wait for worker to be idle before modifying emulator state
+        while (worker_states_[idx]->load(std::memory_order_acquire) != STATE_IDLE) {
+            std::this_thread::yield();
+        }
+        emulators_[idx]->restore(reinterpret_cast<const NES::Core*>(state.request().ptr));
+        emulators_[idx]->ppu_step();
+    }
+    
 private:
     void check_idx(int idx) const {
         if (idx < 0 || idx >= num_envs_) {
@@ -205,6 +258,14 @@ private:
     }
     
     void worker_loop(int idx) {
+        // Signal that this worker is ready (has reached its wait loop)
+        {
+            std::lock_guard<std::mutex> lock(ready_mutex_);
+            if (ready_count_.fetch_add(1, std::memory_order_release) + 1 == num_envs_) {
+                ready_cv_.notify_one();
+            }
+        }
+        
         while (true) {
             {
                 std::unique_lock<std::mutex> lock(start_mutex_);
@@ -243,6 +304,11 @@ private:
     std::mutex done_mutex_;
     std::condition_variable done_cv_;
     std::atomic<int> done_count_;
+    
+    // Worker ready synchronization
+    std::mutex ready_mutex_;
+    std::condition_variable ready_cv_;
+    std::atomic<int> ready_count_;
 };
 
 PYBIND11_MODULE(emulator, m) {   
@@ -357,6 +423,10 @@ PYBIND11_MODULE(emulator, m) {
              py::arg("actions"),
              "Step all emulators 1 frame in parallel")
         
+        .def("step_single", &VectorEmulator::step_single,
+             py::arg("idx"), py::arg("action"),
+             "Step a single emulator (synchronous, no threading)")
+        
         .def("screen_buffer", 
              py::overload_cast<>(&VectorEmulator::screen_buffer),
              "Get screen buffers for all emulators as list of zero-copy views")
@@ -378,5 +448,13 @@ PYBIND11_MODULE(emulator, m) {
         .def("controller", &VectorEmulator::controller,
              py::arg("idx"), py::arg("port") = 0,
              "Get controller buffer for single emulator as zero-copy view")
+        
+        .def("dump_state", &VectorEmulator::dump_state,
+             py::arg("idx"),
+             "Dump state for single emulator")
+        
+        .def("load_state", &VectorEmulator::load_state,
+             py::arg("idx"), py::arg("state"),
+             "Load state for single emulator")
     ;
 };
