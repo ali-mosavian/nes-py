@@ -37,6 +37,24 @@
 namespace py = pybind11;
 
 // =============================================================================
+// RAM Read Specification - for batch reading after step
+// =============================================================================
+
+enum class RamReadType {
+    INT = 0,   // Single byte as integer
+    BCD = 1    // Multiple bytes as BCD (Binary Coded Decimal)
+};
+
+struct RamReadSpec {
+    uint16_t address;
+    uint8_t size;        // 1-6 bytes
+    RamReadType type;
+    
+    RamReadSpec(uint16_t addr, uint8_t sz, RamReadType t) 
+        : address(addr), size(sz), type(t) {}
+};
+
+// =============================================================================
 // CPU Affinity - Pin threads to specific cores for better cache locality
 // =============================================================================
 
@@ -317,6 +335,9 @@ private:
         for (int i = 0; i < num_envs_; i++) {
             worker_states_[i]->state.store(STATE_IDLE, std::memory_order_release);
         }
+        
+        // Read configured RAM values (batch read in C++)
+        read_ram_values();
     }
     
     void worker_loop(int idx) {
@@ -359,6 +380,70 @@ private:
     
     // Worker ready synchronization (only used during startup)
     std::atomic<int> ready_count_;
+    
+    // RAM read configuration (set once, used every step)
+    std::vector<RamReadSpec> ram_specs_;
+    std::vector<int32_t> ram_values_;  // Shape: [num_envs * num_specs], row-major
+    int num_ram_specs_ = 0;
+    
+    // Read BCD value from RAM (e.g., score stored as 6 separate digits)
+    inline int32_t read_bcd(const uint8_t* ram, uint16_t addr, int size) const {
+        int32_t result = 0;
+        for (int i = 0; i < size; i++) {
+            result = result * 10 + ram[addr + i];
+        }
+        return result;
+    }
+    
+    // Read RAM values for all emulators after step (called from main thread)
+    void read_ram_values() {
+        if (num_ram_specs_ == 0) return;
+        
+        for (int env = 0; env < num_envs_; env++) {
+            const uint8_t* ram = reinterpret_cast<const uint8_t*>(
+                emulators_[env]->get_memory_buffer());
+            int base = env * num_ram_specs_;
+            
+            for (int s = 0; s < num_ram_specs_; s++) {
+                const auto& spec = ram_specs_[s];
+                if (spec.type == RamReadType::BCD) {
+                    ram_values_[base + s] = read_bcd(ram, spec.address, spec.size);
+                } else {
+                    ram_values_[base + s] = ram[spec.address];
+                }
+            }
+        }
+    }
+    
+public:
+    // Configure RAM addresses to read after each step
+    // specs: list of (address, size, type) where type is 0=INT, 1=BCD
+    void configure_ram_reads(const std::vector<std::tuple<uint16_t, uint8_t, int>>& specs) {
+        ram_specs_.clear();
+        ram_specs_.reserve(specs.size());
+        
+        for (const auto& [addr, size, type] : specs) {
+            ram_specs_.emplace_back(addr, size, 
+                type == 1 ? RamReadType::BCD : RamReadType::INT);
+        }
+        
+        num_ram_specs_ = static_cast<int>(ram_specs_.size());
+        ram_values_.resize(num_envs_ * num_ram_specs_);
+    }
+    
+    // Get RAM values as numpy array, shape: (num_envs, num_specs)
+    py::array_t<int32_t> ram_values() const {
+        if (num_ram_specs_ == 0) {
+            return py::array_t<int32_t>({num_envs_, 0});
+        }
+        
+        return py::array_t<int32_t>(
+            {num_envs_, num_ram_specs_},
+            {num_ram_specs_ * sizeof(int32_t), sizeof(int32_t)},
+            ram_values_.data(),
+            py::capsule(ram_values_.data(), [](void*) {})
+        );
+    }
 };
 
 PYBIND11_MODULE(emulator, m) {   
@@ -506,5 +591,28 @@ PYBIND11_MODULE(emulator, m) {
         .def("load_state", &VectorEmulator::load_state,
              py::arg("idx"), py::arg("state"),
              "Load state for single emulator")
+        
+        .def("configure_ram_reads", &VectorEmulator::configure_ram_reads,
+             py::arg("specs"),
+             R"doc(
+Configure RAM addresses to read after each step.
+
+Args:
+    specs: List of (address, size, type) tuples where:
+        - address: RAM address (0x0000-0x07FF)
+        - size: Number of bytes to read (1-6)
+        - type: 0=INT (single byte), 1=BCD (multiple digits)
+
+Example:
+    emulator.configure_ram_reads([
+        (0x07DE, 6, 1),  # score (6 BCD digits)
+        (0x07F8, 3, 1),  # time (3 BCD digits)
+        (0x07ED, 2, 1),  # coins (2 BCD digits)
+        (0x075A, 1, 0),  # life (1 byte int)
+    ])
+)doc")
+        
+        .def("ram_values", &VectorEmulator::ram_values,
+             "Get RAM values from last step as numpy array, shape: (num_envs, num_specs)")
     ;
 };
