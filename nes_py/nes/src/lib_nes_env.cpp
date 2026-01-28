@@ -363,11 +363,26 @@ private:
     void worker_loop(int idx) {
         using clock = std::chrono::high_resolution_clock;
         
-        // Pin this worker thread to a specific CPU core for better cache locality
-        // This is especially important on NUMA systems (e.g., AMD EPYC)
+        // Pin this worker thread to spread across NUMA nodes for better memory bandwidth
+        // On multi-socket systems (e.g., AMD EPYC), alternate workers between NUMA nodes
+        // to avoid all workers competing for same memory controller
         int num_cores = std::thread::hardware_concurrency();
-        int target_core = (num_cores > 0) ? (idx % num_cores) : -1;
-        pin_thread_to_core(idx);
+        int target_core = -1;
+        if (num_cores > 0) {
+            // NUMA-aware pinning: spread workers across sockets
+            // Assumes 2 NUMA nodes with cores_per_numa cores each
+            // Worker 0 -> NUMA 0 core 0, Worker 1 -> NUMA 1 core 0, 
+            // Worker 2 -> NUMA 0 core 1, Worker 3 -> NUMA 1 core 1, etc.
+            int cores_per_numa = num_cores / 2;
+            if (cores_per_numa > 0) {
+                int numa_node = idx % 2;
+                int core_in_numa = (idx / 2) % cores_per_numa;
+                target_core = numa_node * cores_per_numa + core_in_numa;
+            } else {
+                target_core = idx % num_cores;
+            }
+        }
+        pin_thread_to_core(target_core);
         worker_timings_[idx].pinned_core = target_core;
         
         // Signal that this worker is ready
