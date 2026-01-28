@@ -33,6 +33,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
+#include <chrono>
 
 namespace py = pybind11;
 
@@ -301,6 +302,9 @@ private:
     }
     
     void step_impl(py::array_t<uint8_t> actions, int num_frames) {
+        using clock = std::chrono::high_resolution_clock;
+        auto t0 = clock::now();
+        
         auto actions_buf = actions.request();
         uint8_t* actions_ptr = static_cast<uint8_t*>(actions_buf.ptr);
         
@@ -310,6 +314,8 @@ private:
             worker_frames_[i] = num_frames;
             worker_states_[i]->state.store(STATE_PENDING, std::memory_order_release);
         }
+        
+        auto t1 = clock::now();
         
         // Busy-wait for all workers to complete (GIL released, lock-free)
         {
@@ -331,13 +337,26 @@ private:
             }
         }
         
+        auto t2 = clock::now();
+        
         // Mark workers idle (ready for next step)
         for (int i = 0; i < num_envs_; i++) {
             worker_states_[i]->state.store(STATE_IDLE, std::memory_order_release);
         }
         
+        auto t3 = clock::now();
+        
         // Read configured RAM values (batch read in C++)
         read_ram_values();
+        
+        auto t4 = clock::now();
+        
+        // Accumulate timing stats
+        timing_setup_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+        timing_wait_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+        timing_idle_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t3 - t2).count();
+        timing_ram_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(t4 - t3).count();
+        timing_calls_++;
     }
     
     void worker_loop(int idx) {
@@ -385,6 +404,13 @@ private:
     std::vector<RamReadSpec> ram_specs_;
     std::vector<int32_t> ram_values_;  // Shape: [num_envs * num_specs], row-major
     int num_ram_specs_ = 0;
+    
+    // Timing instrumentation (nanoseconds)
+    uint64_t timing_setup_ns_ = 0;   // Set actions + signal workers
+    uint64_t timing_wait_ns_ = 0;    // Wait for workers to complete
+    uint64_t timing_idle_ns_ = 0;    // Mark workers idle
+    uint64_t timing_ram_ns_ = 0;     // Read RAM values
+    uint64_t timing_calls_ = 0;      // Number of step calls
     
     // Read BCD value from RAM (e.g., score stored as 6 separate digits)
     inline int32_t read_bcd(const uint8_t* ram, uint16_t addr, int size) const {
@@ -448,6 +474,22 @@ public:
             ram_values_.data(),
             py::capsule(ram_values_.data(), [](void*) {})
         );
+    }
+    
+    // Get timing stats as dict and reset counters
+    py::dict get_timing_stats() {
+        py::dict stats;
+        if (timing_calls_ > 0) {
+            stats["calls"] = timing_calls_;
+            stats["setup_ms"] = timing_setup_ns_ / 1e6;
+            stats["wait_ms"] = timing_wait_ns_ / 1e6;
+            stats["idle_ms"] = timing_idle_ns_ / 1e6;
+            stats["ram_ms"] = timing_ram_ns_ / 1e6;
+            stats["total_ms"] = (timing_setup_ns_ + timing_wait_ns_ + timing_idle_ns_ + timing_ram_ns_) / 1e6;
+        }
+        // Reset
+        timing_setup_ns_ = timing_wait_ns_ = timing_idle_ns_ = timing_ram_ns_ = timing_calls_ = 0;
+        return stats;
     }
 };
 
@@ -619,5 +661,18 @@ Example:
         
         .def("ram_values", &VectorEmulator::ram_values,
              "Get RAM values from last step as numpy array, shape: (num_envs, num_specs)")
+        
+        .def("get_timing_stats", &VectorEmulator::get_timing_stats,
+             R"doc(
+Get timing stats for step() breakdown and reset counters.
+
+Returns dict with:
+    - calls: Number of step() calls since last reset
+    - setup_ms: Time to set actions + signal workers (ms)
+    - wait_ms: Time waiting for workers to complete (ms)
+    - idle_ms: Time to mark workers idle (ms)
+    - ram_ms: Time to read RAM values (ms)
+    - total_ms: Total C++ time in step() (ms)
+)doc")
     ;
 };
