@@ -363,36 +363,10 @@ private:
     void worker_loop(int idx) {
         using clock = std::chrono::high_resolution_clock;
         
-        // Pin this worker thread to spread across NUMA nodes for better memory bandwidth
-        // On AMD EPYC dual-socket with SMT:
-        //   - num_cores = 256 (128 physical * 2 threads)
-        //   - Physical cores: NUMA0 = 0-63, NUMA1 = 64-127
-        //   - Hyperthreads:   NUMA0 = 128-191, NUMA1 = 192-255
-        // We want to use physical cores first, spread across NUMA nodes:
-        //   Worker 0 -> core 0 (NUMA0), Worker 1 -> core 64 (NUMA1)
-        //   Worker 2 -> core 1 (NUMA0), Worker 3 -> core 65 (NUMA1), etc.
+        // Pin this worker thread to a core in round-robin fashion
+        // Worker 0 -> core 0, Worker 1 -> core 1, etc. (wraps around)
         int num_cores = std::thread::hardware_concurrency();
-        int target_core = -1;
-        if (num_cores > 0) {
-            // Assume SMT with 2 threads per core -> num_physical = num_cores / 2
-            int num_physical = num_cores / 2;
-            if (num_physical >= 2) {
-                // Physical cores per NUMA node (assume 2 NUMA nodes)
-                int phys_per_numa = num_physical / 2;  // e.g., 128/2 = 64
-                if (phys_per_numa > 0) {
-                    // Spread workers across NUMA nodes using physical cores only
-                    int numa_node = idx % 2;
-                    int core_in_numa = (idx / 2) % phys_per_numa;
-                    // NUMA0 physical: 0 to phys_per_numa-1
-                    // NUMA1 physical: phys_per_numa to 2*phys_per_numa-1
-                    target_core = numa_node * phys_per_numa + core_in_numa;
-                } else {
-                    target_core = idx % num_physical;
-                }
-            } else {
-                target_core = idx % num_cores;
-            }
-        }
+        int target_core = (num_cores > 0) ? (idx % num_cores) : -1;
         pin_thread_to_core(target_core);
         worker_timings_[idx].pinned_core = target_core;
         
