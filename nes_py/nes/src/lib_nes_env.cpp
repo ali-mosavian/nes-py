@@ -130,6 +130,7 @@ public:
         emulators_.reserve(num_envs);
         worker_states_.reserve(num_envs);
         worker_frames_.resize(num_envs, 1);
+        worker_timings_.resize(num_envs);
         
         for (int i = 0; i < num_envs; i++) {
             emulators_.push_back(std::make_unique<NES::Emulator>(rom_path));
@@ -360,14 +361,21 @@ private:
     }
     
     void worker_loop(int idx) {
+        using clock = std::chrono::high_resolution_clock;
+        
         // Pin this worker thread to a specific CPU core for better cache locality
         // This is especially important on NUMA systems (e.g., AMD EPYC)
+        int num_cores = std::thread::hardware_concurrency();
+        int target_core = (num_cores > 0) ? (idx % num_cores) : -1;
         pin_thread_to_core(idx);
+        worker_timings_[idx].pinned_core = target_core;
         
         // Signal that this worker is ready
         ready_count_.fetch_add(1, std::memory_order_release);
         
         while (true) {
+            auto t0 = clock::now();
+            
             // Busy-wait for work (lock-free - each worker only checks its own state)
             int state;
             while (true) {
@@ -375,6 +383,8 @@ private:
                 if (state == STATE_PENDING || state == STATE_EXIT) break;
                 std::this_thread::yield();
             }
+            
+            auto t1 = clock::now();
             
             if (state == STATE_EXIT) {
                 return;
@@ -385,8 +395,15 @@ private:
                 emulators_[idx]->step();
             }
             
+            auto t2 = clock::now();
+            
             // Signal completion (lock-free - just update our own state)
             worker_states_[idx]->state.store(STATE_DONE, std::memory_order_release);
+            
+            // Record timing
+            worker_timings_[idx].wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+            worker_timings_[idx].step_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count();
+            worker_timings_[idx].calls++;
         }
     }
     
@@ -405,12 +422,22 @@ private:
     std::vector<int32_t> ram_values_;  // Shape: [num_envs * num_specs], row-major
     int num_ram_specs_ = 0;
     
-    // Timing instrumentation (nanoseconds)
+    // Timing instrumentation (nanoseconds) - main thread
     uint64_t timing_setup_ns_ = 0;   // Set actions + signal workers
     uint64_t timing_wait_ns_ = 0;    // Wait for workers to complete
     uint64_t timing_idle_ns_ = 0;    // Mark workers idle
     uint64_t timing_ram_ns_ = 0;     // Read RAM values
     uint64_t timing_calls_ = 0;      // Number of step calls
+    
+    // Per-worker timing (cache-line aligned to prevent false sharing)
+    struct alignas(64) WorkerTiming {
+        uint64_t wait_ns = 0;    // Time waiting for work
+        uint64_t step_ns = 0;    // Time doing emulator step
+        uint64_t calls = 0;      // Number of step calls
+        int pinned_core = -1;    // Core this worker is pinned to
+        char padding[64 - 32];   // Pad to cache line
+    };
+    std::vector<WorkerTiming> worker_timings_;
     
     // Read BCD value from RAM (e.g., score stored as 6 separate digits)
     inline int32_t read_bcd(const uint8_t* ram, uint16_t addr, int size) const {
@@ -487,9 +514,34 @@ public:
             stats["ram_ms"] = timing_ram_ns_ / 1e6;
             stats["total_ms"] = (timing_setup_ns_ + timing_wait_ns_ + timing_idle_ns_ + timing_ram_ns_) / 1e6;
         }
-        // Reset
+        // Reset main thread timing
         timing_setup_ns_ = timing_wait_ns_ = timing_idle_ns_ = timing_ram_ns_ = timing_calls_ = 0;
         return stats;
+    }
+    
+    // Get per-worker timing stats and reset counters
+    py::list get_worker_timing_stats() {
+        py::list workers;
+        for (int i = 0; i < num_envs_; i++) {
+            py::dict w;
+            w["worker"] = i;
+            w["core"] = worker_timings_[i].pinned_core;
+            w["calls"] = worker_timings_[i].calls;
+            w["wait_ms"] = worker_timings_[i].wait_ns / 1e6;
+            w["step_ms"] = worker_timings_[i].step_ns / 1e6;
+            if (worker_timings_[i].calls > 0) {
+                w["step_avg_us"] = (worker_timings_[i].step_ns / worker_timings_[i].calls) / 1e3;
+            } else {
+                w["step_avg_us"] = 0.0;
+            }
+            workers.append(w);
+            
+            // Reset
+            worker_timings_[i].wait_ns = 0;
+            worker_timings_[i].step_ns = 0;
+            worker_timings_[i].calls = 0;
+        }
+        return workers;
     }
 };
 
@@ -673,6 +725,19 @@ Returns dict with:
     - idle_ms: Time to mark workers idle (ms)
     - ram_ms: Time to read RAM values (ms)
     - total_ms: Total C++ time in step() (ms)
+)doc")
+        
+        .def("get_worker_timing_stats", &VectorEmulator::get_worker_timing_stats,
+             R"doc(
+Get per-worker timing stats and reset counters.
+
+Returns list of dicts, one per worker:
+    - worker: Worker index
+    - core: CPU core this worker is pinned to
+    - calls: Number of step calls
+    - wait_ms: Time spent waiting for work (ms)
+    - step_ms: Time spent stepping emulator (ms)
+    - step_avg_us: Average step time per call (microseconds)
 )doc")
     ;
 };
