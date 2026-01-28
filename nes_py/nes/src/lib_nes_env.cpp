@@ -364,20 +364,31 @@ private:
         using clock = std::chrono::high_resolution_clock;
         
         // Pin this worker thread to spread across NUMA nodes for better memory bandwidth
-        // On multi-socket systems (e.g., AMD EPYC), alternate workers between NUMA nodes
-        // to avoid all workers competing for same memory controller
+        // On AMD EPYC dual-socket with SMT:
+        //   - num_cores = 256 (128 physical * 2 threads)
+        //   - Physical cores: NUMA0 = 0-63, NUMA1 = 64-127
+        //   - Hyperthreads:   NUMA0 = 128-191, NUMA1 = 192-255
+        // We want to use physical cores first, spread across NUMA nodes:
+        //   Worker 0 -> core 0 (NUMA0), Worker 1 -> core 64 (NUMA1)
+        //   Worker 2 -> core 1 (NUMA0), Worker 3 -> core 65 (NUMA1), etc.
         int num_cores = std::thread::hardware_concurrency();
         int target_core = -1;
         if (num_cores > 0) {
-            // NUMA-aware pinning: spread workers across sockets
-            // Assumes 2 NUMA nodes with cores_per_numa cores each
-            // Worker 0 -> NUMA 0 core 0, Worker 1 -> NUMA 1 core 0, 
-            // Worker 2 -> NUMA 0 core 1, Worker 3 -> NUMA 1 core 1, etc.
-            int cores_per_numa = num_cores / 2;
-            if (cores_per_numa > 0) {
-                int numa_node = idx % 2;
-                int core_in_numa = (idx / 2) % cores_per_numa;
-                target_core = numa_node * cores_per_numa + core_in_numa;
+            // Assume SMT with 2 threads per core -> num_physical = num_cores / 2
+            int num_physical = num_cores / 2;
+            if (num_physical >= 2) {
+                // Physical cores per NUMA node (assume 2 NUMA nodes)
+                int phys_per_numa = num_physical / 2;  // e.g., 128/2 = 64
+                if (phys_per_numa > 0) {
+                    // Spread workers across NUMA nodes using physical cores only
+                    int numa_node = idx % 2;
+                    int core_in_numa = (idx / 2) % phys_per_numa;
+                    // NUMA0 physical: 0 to phys_per_numa-1
+                    // NUMA1 physical: phys_per_numa to 2*phys_per_numa-1
+                    target_core = numa_node * phys_per_numa + core_in_numa;
+                } else {
+                    target_core = idx % num_physical;
+                }
             } else {
                 target_core = idx % num_cores;
             }
