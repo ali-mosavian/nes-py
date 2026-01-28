@@ -422,7 +422,10 @@ public:
         ram_specs_.clear();
         ram_specs_.reserve(specs.size());
         
-        for (const auto& [addr, size, type] : specs) {
+        for (const auto& spec : specs) {
+            uint16_t addr = std::get<0>(spec);
+            uint8_t size = std::get<1>(spec);
+            int type = std::get<2>(spec);
             ram_specs_.emplace_back(addr, size, 
                 type == 1 ? RamReadType::BCD : RamReadType::INT);
         }
@@ -434,12 +437,14 @@ public:
     // Get RAM values as numpy array, shape: (num_envs, num_specs)
     py::array_t<int32_t> ram_values() const {
         if (num_ram_specs_ == 0) {
-            return py::array_t<int32_t>({num_envs_, 0});
+            // Return empty array with explicit shape
+            std::vector<ssize_t> shape = {static_cast<ssize_t>(num_envs_), 0};
+            return py::array_t<int32_t>(shape);
         }
         
         return py::array_t<int32_t>(
             {num_envs_, num_ram_specs_},
-            {num_ram_specs_ * sizeof(int32_t), sizeof(int32_t)},
+            {num_ram_specs_ * static_cast<int>(sizeof(int32_t)), static_cast<int>(sizeof(int32_t))},
             ram_values_.data(),
             py::capsule(ram_values_.data(), [](void*) {})
         );
